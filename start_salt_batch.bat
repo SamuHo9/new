@@ -1,6 +1,6 @@
 @echo off
 set "SLICER_EXE=C:\Program Files\SlicerSALT 6.0.0\SlicerSALT.exe"
-set "SCRIPT_PATH=%~dp0run_spharm_batch.py"
+set "SCRIPT_PATH=%~dp0SPHARM\run_spharm_batch.py"
 
 echo ============================================================
 echo Starting Slicer SALT SPHARM Analysis (Background Mode)

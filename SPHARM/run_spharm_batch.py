@@ -1,11 +1,58 @@
 import os
-import glob
-import slicer
-import time
 import sys
+
+def _bootstrap_slicer():
+    try:
+        import slicer
+        return
+    except ImportError:
+        pass
+
+    candidates = [
+        os.environ.get("SLICER_EXE", ""),
+        r"C:\Program Files\SlicerSALT 6.0.0\SlicerSALT.exe",
+        r"C:\Program Files\SlicerSALT 5.0.0\SlicerSALT.exe",
+    ]
+    slicer_exe = None
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            slicer_exe = cand
+            break
+
+    if not slicer_exe:
+        print("[ERROR] SlicerSALT not found!")
+        print("        Expected location: C:\\Program Files\\SlicerSALT 6.0.0\\SlicerSALT.exe")
+        print("        Set env var SLICER_EXE or check your installation.")
+        sys.exit(1)
+
+    import subprocess
+    script_path = os.path.abspath(__file__)
+    cmd = [slicer_exe, "--no-main-window", "--no-splash",
+           "--python-script", script_path] + sys.argv[1:]
+    print(f"[INFO] No 'slicer' module in this Python. Re-launching via SlicerSALT:")
+    print(f"       {slicer_exe}")
+    sys.exit(subprocess.call(cmd))
+
+_bootstrap_slicer()
+
+import glob
+import time
 import argparse
 import subprocess
 from datetime import datetime
+import slicer
+import vtk
+import numpy as np
+
+def prompt_folder(title):
+    try:
+        import qt
+        folder = qt.QFileDialog.getExistingDirectory(None, title)
+        if not folder:
+            return None
+        return folder
+    except Exception:
+        return None
 
 def get_script_dir():
     try:
@@ -18,12 +65,13 @@ def get_script_dir():
 
 SCRIPT_DIR = get_script_dir()
 
-def sprint(msg, log_file):
+def sprint(msg, log_file=None):
     print(msg)
     sys.stdout.flush()
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    with open(log_file, 'a') as f:
-        f.write(f"[{timestamp}] {msg}\n")
+    if log_file:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        with open(log_file, 'a') as f:
+            f.write(f"[{timestamp}] {msg}\n")
 
 def cleanup_subject_files(output_base_dir, basename):
     patterns = [
@@ -320,30 +368,22 @@ def process_single_subject(file_path, index, total_files, output_base_dir, args,
         grid_vtk = f"{spharm_base}_SPHARM_grid.vtk"
 
         if os.path.exists(final_vtk) and os.path.exists(final_coef):
-            theta_step, phi_step = "4.5", "4.5"
+            theta_step, phi_step = 4.5, 4.5
             sprint(f"  - SUCCESS: {basename} completed. Resampling to {theta_step}x{phi_step} degree grid...", log_file)
 
-            resample_script = os.path.join(SCRIPT_DIR, "resample_spharm_grid.py")
-            if not os.path.isfile(resample_script):
-                sprint(f"  - WARNING: resample_spharm_grid.py not found at {resample_script}", log_file)
-            else:
-                cmd = [sys.executable, resample_script, final_coef, grid_vtk, theta_step, phi_step]
-                sprint(f"  - Running: {' '.join(cmd)}", log_file)
-                try:
-                    kwargs = {}
-                    if os.name == 'nt':
-                        kwargs['creationflags'] = 0x08000000
-                    result = subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
-                    if result.stdout:
-                        sprint(f"  - Resample stdout: {result.stdout.strip()}", log_file)
-                except subprocess.CalledProcessError as sub_err:
-                    sprint(f"  - ERROR: resample_spharm_grid.py failed (exit {sub_err.returncode})", log_file)
-                    sprint(f"  - stderr: {sub_err.stderr.strip()}", log_file)
-
-                if os.path.exists(grid_vtk):
-                    sprint(f"  - SUCCESS: {basename} Grid VTK created.", log_file)
-                else:
-                    sprint(f"  - WARNING: Grid resampling failed for {basename}.", log_file)
+            try:
+                if SCRIPT_DIR not in sys.path:
+                    sys.path.insert(0, SCRIPT_DIR)
+                import resample_spharm_grid
+                coeffs = resample_spharm_grid.parse_coef(final_coef)
+                L = int(np.sqrt(len(coeffs))) - 1
+                theta_deg = np.linspace(0, 180, int(180/theta_step) + 1)
+                phi_deg = np.linspace(0, 360, int(360/phi_step) + 1)[:-1]
+                X, Y, Z = resample_spharm_grid.evaluate_spharm(coeffs, L, np.radians(theta_deg), np.radians(phi_deg))
+                resample_spharm_grid.save_grid_vtk(X, Y, Z, theta_deg, phi_deg, grid_vtk)
+                sprint(f"  - SUCCESS: {basename} Grid VTK created ({len(theta_deg)}x{len(phi_deg)} grid).", log_file)
+            except Exception as resample_err:
+                sprint(f"  - WARNING: Grid resampling failed for {basename}: {resample_err}", log_file)
         else:
             sprint(f"  - ERROR: Result VTK not generated for {basename}.", log_file)
 
@@ -376,13 +416,41 @@ def run_batch_spharm():
     else:
         NUM_ITER, SUBDIV, DEGREE, MODE_TAG = 1000, 10, 12, "PRODUCTION"
 
-    output_root = os.path.abspath(args.output_dir) if args.output_dir else os.path.join(SCRIPT_DIR, "output")
-    input_dir = os.path.abspath(args.input_dir) if args.input_dir else os.path.join(output_root, "aligned_nifti")
+    input_dir = os.path.abspath(args.input_dir) if args.input_dir else None
+    output_root = os.path.abspath(args.output_dir) if args.output_dir else None
+
+    if not input_dir:
+        cand_default = os.path.join(SCRIPT_DIR, "output", "aligned_nifti")
+        cand_icp = os.path.join(os.path.dirname(SCRIPT_DIR), "ICP", "output", "aligned_nifti")
+
+        if os.path.isdir(cand_default) and len(glob.glob(os.path.join(cand_default, "*.nii*"))) > 0:
+            input_dir = cand_default
+            print(f"[INFO] Auto-detected input aligned NIfTI directory: {input_dir}")
+        elif os.path.isdir(cand_icp) and len(glob.glob(os.path.join(cand_icp, "*.nii*"))) > 0:
+            input_dir = cand_icp
+            print(f"[INFO] Auto-detected ICP aligned NIfTI directory: {input_dir}")
+        else:
+            print("[INFO] No --input_dir specified. Opening folder picker dialog...")
+            input_dir = prompt_folder("Select input folder containing aligned NIfTI labels (.nii.gz)")
+            if not input_dir:
+                print("[ERROR] No input folder selected. Exiting.")
+                return
+
+    if not output_root:
+        if os.path.basename(os.path.normpath(input_dir)) == "aligned_nifti":
+            output_root = os.path.dirname(os.path.normpath(input_dir))
+        else:
+            output_root = os.path.join(SCRIPT_DIR, "output")
+
     output_base_dir = os.path.join(output_root, "spharm_results")
     os.makedirs(output_base_dir, exist_ok=True)
 
     log_file = init_logging(output_base_dir, input_dir, output_root, MODE_TAG, NUM_ITER, SUBDIV, DEGREE)
     file_list = find_label_files(input_dir, log_file)
+    if not file_list:
+        sprint(f"[ERROR] No valid NIfTI label files found in {input_dir}", log_file)
+        return
+
     template_info = resolve_reference_template(args, file_list, output_base_dir, log_file)
 
     config = {'num_iter': NUM_ITER, 'subdiv': SUBDIV, 'degree': DEGREE}

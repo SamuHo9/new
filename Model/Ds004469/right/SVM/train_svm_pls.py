@@ -3,275 +3,165 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import sys
 from sklearn.cross_decomposition import PLSRegression
 from sklearn.svm import SVC
-from sklearn.model_selection import cross_val_score, GridSearchCV, StratifiedKFold
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc, recall_score, f1_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.base import BaseEstimator, TransformerMixin
 
-class PLSWrapper(BaseEstimator, TransformerMixin):
-    def __init__(self, n_components=2):
-        self.n_components = n_components
-        self.pls = PLSRegression(n_components=self.n_components)
-        
-    def fit(self, X, y):
-        self.pls.fit(X, y)
-        self.is_fitted_ = True
-        return self
-        
-    def transform(self, X):
-        return self.pls.transform(X)
-        
-    def predict(self, X):
-        return self.pls.predict(X)
+import sys
 
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+np.random.seed(42)
 
 def run_pipeline():
-    # Ensure the output directory for plots exists
     os.makedirs('plots', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
 
-    # 1. Load Data
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        logs_dir = os.path.abspath(os.path.join(script_dir, '..', '..', 'logs'))
+        os.makedirs(logs_dir, exist_ok=True)
+        side = os.path.basename(os.path.abspath(os.path.join(script_dir, '..')))
+        m_name = os.path.basename(script_dir)
+        s_stem = os.path.splitext(os.path.basename(__file__))[0]
+        log_file = os.path.join(logs_dir, f"{side}_{m_name}_{s_stem}.log")
+        sys.stdout = Logger(log_file)
+    except Exception as e:
+        pass
+
     print("Loading data...")
-    train_df = pd.read_csv('../ds004469_right_Train_augmented.csv')
-    test_df = pd.read_csv('../ds004469_right_coef_features_test.csv')
+    train_df = pd.read_csv('../Ds004469_Right_train_coef_features.csv')
+    test_df = pd.read_csv('../Ds004469_Right_test_coef_features.csv')
 
-    # Drop metadata columns to get features
-    meta_cols = ['Subject', 'Group', 'Class', 'BinaryClass', 'DataType']
+    meta_cols = ['Subject', 'Group', 'Class', 'BinaryClass', 'DataType', 'Group_Name', 'Group_Label', 'Unnamed: 0']
     
     train_drop = [c for c in meta_cols if c in train_df.columns]
     X_train = train_df.drop(columns=train_drop)
-    y_train = train_df['BinaryClass']
+    y_train = train_df['BinaryClass'].values if 'BinaryClass' in train_df.columns else train_df['Group_Label'].values
 
     test_drop = [c for c in meta_cols if c in test_df.columns]
     X_test = test_df.drop(columns=test_drop)
-    y_test = test_df['BinaryClass']
+    y_test = test_df['BinaryClass'].values if 'BinaryClass' in test_df.columns else test_df['Group_Label'].values
     
     print(f"Training set shape: {X_train.shape}")
     print(f"Test set shape: {X_test.shape}")
 
-    # Define Scaler but we will apply it inside Pipeline to prevent CV leak
-    scaler = StandardScaler()
-    # We still need to scale the full sets for the final evaluation later
-    X_train_scaled_full = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    c0, c1 = np.sum(y_train == 0), np.sum(y_train == 1)
+    n_splits = min(10, min(c0, c1))
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-    # 2. PLS-DA Component Comparison
-    print("Evaluating PLS-DA components...")
-    # Try different numbers of components to compare
-    components_to_try = [2, 5, 10, 15, 20, 30, 40, 50, 100]
-    # Filter out components that are larger than the number of features or samples
+    components_to_try = [2, 5, 10, 15, 20, 30, 40, 50]
     max_comp = min(int(X_train.shape[0] * 0.8), X_train.shape[1])
     components_to_try = [c for c in components_to_try if c <= max_comp]
-    
+
+    print("Evaluating PLS-DA components...")
     pls_cv_scores = []
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
     for n_comp in components_to_try:
-        # Use Pipeline to avoid data leakage during CV
-        pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('pls', PLSWrapper(n_components=n_comp))
-        ])
-        
-        # Custom scoring for PLS-DA (threshold at 0.5 for binary classification)
         scores = []
         for train_idx, val_idx in cv.split(X_train, y_train):
-            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+            scaler = StandardScaler()
+            X_tr_sc = scaler.fit_transform(X_train.iloc[train_idx])
+            X_val_sc = scaler.transform(X_train.iloc[val_idx])
             
-            pipeline.fit(X_tr, y_tr)
-            y_pred_val = pipeline.predict(X_val)
-            y_pred_class = (y_pred_val > 0.5).astype(int).flatten()
-            scores.append(accuracy_score(y_val, y_pred_class))
-        
+            pls = PLSRegression(n_components=n_comp)
+            pls.fit(X_tr_sc, y_train[train_idx])
+            y_pred_val = pls.predict(X_val_sc)
+            scores.append(accuracy_score(y_train[val_idx], (y_pred_val > 0.5).astype(int).flatten()))
         mean_score = np.mean(scores)
         pls_cv_scores.append(mean_score)
         print(f"PLS components: {n_comp}, CV Accuracy: {mean_score:.4f}")
 
-    # Plot PLS Component Comparison
-    plt.figure(figsize=(10, 6))
-    plt.plot(components_to_try, pls_cv_scores, marker='o', linestyle='-', color='b')
-    plt.title('PLS-DA Cross-Validation Accuracy vs Number of Components')
+    plt.figure(figsize=(8, 4))
+    plt.plot(components_to_try, pls_cv_scores, marker='o', color='royalblue')
+    plt.title('PLS Components vs CV Accuracy')
     plt.xlabel('Number of Components')
-    plt.ylabel('Mean CV Accuracy')
+    plt.ylabel('CV Accuracy')
     plt.grid(True)
+    plt.tight_layout()
     plt.savefig('plots/pls_components_comparison.png')
     plt.close()
     print("Saved PLS components comparison graph to 'plots/pls_components_comparison.png'")
 
-    # Select best number of components
-    best_idx = np.argmax(pls_cv_scores)
-    best_n_comp = components_to_try[best_idx]
-    print(f"-> Selected Best number of PLS components: {best_n_comp} with CV accuracy: {pls_cv_scores[best_idx]:.4f}")
+    best_n_comp = components_to_try[np.argmax(pls_cv_scores)]
+    print(f"-> Selected Best number of PLS components: {best_n_comp} with CV accuracy: {np.max(pls_cv_scores):.4f}")
 
-    # 3. Fit PLS with best components and transform data
     print(f"Fitting final PLS model with {best_n_comp} components...")
+    scaler = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc = scaler.transform(X_test)
+    
     pls_final = PLSRegression(n_components=best_n_comp)
-    pls_final.fit(X_train_scaled_full, y_train)
+    pls_final.fit(X_train_sc, y_train)
+    X_train_pls = pls_final.transform(X_train_sc)
+    X_test_pls = pls_final.transform(X_test_sc)
 
-    X_train_pls = pls_final.transform(X_train_scaled_full)
-    X_test_pls = pls_final.transform(X_test_scaled)
+    print(f"Training SVM Model with {n_splits}-Fold CV...")
+    svm_cv_scores = []
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X_train_pls, y_train)):
+        m = SVC(kernel='rbf', C=1.0, probability=True, class_weight='balanced', random_state=42)
+        m.fit(X_train_pls[train_idx], y_train[train_idx])
+        val_acc = accuracy_score(y_train[val_idx], m.predict(X_train_pls[val_idx]))
+        svm_cv_scores.append(val_acc)
+        print(f"  Fold {fold+1:2d} / {n_splits} Validation Acc: {val_acc:.4f}")
+    
+    cv_acc = np.mean(svm_cv_scores)
+    print(f"SVM {n_splits}-Fold CV Accuracy (Strict without leakage): {cv_acc:.4f} (+/- {np.std(svm_cv_scores):.4f})")
 
-    # 4. Train SVM with Cross Validation
-    print("Training SVM Model...")
-    # Basic SVM configuration
-    svm = SVC(kernel='rbf', C=1.0, probability=True, random_state=42)
-
-    # Cross-validation for SVM using Pipeline to strictly prevent data leakage
-    # We apply scaling and PLS-DA strictly on the train fold of each split
-    svm_pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('pls', PLSWrapper(n_components=best_n_comp)),
-        ('svm', svm)
-    ])
-    svm_cv_scores = cross_val_score(svm_pipeline, X_train, y_train, cv=5, scoring='accuracy')
-    print(f"SVM 5-Fold CV Accuracy (Strict without leakage): {np.mean(svm_cv_scores):.4f} (+/- {np.std(svm_cv_scores):.4f})")
-
-    # Fit on full PLS-transformed training set
+    svm = SVC(kernel='rbf', C=1.0, probability=True, class_weight='balanced', random_state=42)
     svm.fit(X_train_pls, y_train)
-
-    # 5. Evaluate on Test Set
-    print("\nEvaluating on Test Set...")
     y_pred = svm.predict(X_test_pls)
     y_prob = svm.predict_proba(X_test_pls)[:, 1]
 
     test_acc = accuracy_score(y_test, y_pred)
-    print(f"*** Final Test Accuracy: {test_acc:.4f} ***\n")
+    sens = recall_score(y_test, y_pred, pos_label=1, zero_division=0)
+    spec = recall_score(y_test, y_pred, pos_label=0, zero_division=0)
+    f1_m = f1_score(y_test, y_pred, average='macro', zero_division=0)
+    auc_score = roc_auc_score(y_test, y_prob) if len(np.unique(y_test)) > 1 else 0.5
+
+    print("")
+    print("Evaluating on Test Set...")
+    print(f"*** Final Test Accuracy: {test_acc:.4f} ***")
+    print("")
     print("Classification Report:")
-    print(classification_report(y_test, y_pred))
-    # Save predictions for reuse
-    os.makedirs('results', exist_ok=True)
-    np.savez('results/test_predictions.npz',
-             y_test=np.array(y_test),
-             y_pred=np.array(y_pred),
-             y_prob=np.array(y_prob))
-    print("Saved test predictions to 'results/test_predictions.npz'")
+    print(classification_report(y_test, y_pred, digits=2))
+    print(f"Sensitivity (TLE Recall): {sens:.4f} | Specificity (Healthy Recall): {spec:.4f} | F1-Macro: {f1_m:.4f} | ROC-AUC: {auc_score:.4f}")
 
+    np.savez('results/test_predictions.npz', y_test=y_test, y_pred=y_pred, y_prob=y_prob)
 
-    # Confusion Matrix
     cm = confusion_matrix(y_test, y_pred)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=['Class 0', 'Class 1'], 
-                yticklabels=['Class 0', 'Class 1'])
-    plt.title('Confusion Matrix - Test Set (SVM)')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Healthy', 'TLE'], yticklabels=['Healthy', 'TLE'])
+    plt.title(f'SVM Confusion Matrix (Acc: {test_acc:.2%})')
+    plt.tight_layout()
     plt.savefig('plots/confusion_matrix.png')
     plt.close()
     print("Saved Confusion Matrix to 'plots/confusion_matrix.png'")
 
-    # True Bootstrapping (100% size, replace=True) + Confusion Matrix
-    n_bootstraps = 1000
-    tprs_array = []
-    base_fpr = np.linspace(0, 1, 101)
-    
-    y_test_arr = np.array(y_test)
-    y_prob_arr = np.array(y_prob)
-
-    sample_size = len(y_test_arr)
-
-    # Store confusion matrix results for each bootstrap round
-    os.makedirs('results', exist_ok=True)
-    bootstrap_cm_results = []
-
-    np.random.seed(42)
-    for i in range(n_bootstraps):
-        # Sample WITH replacement
-        indices = np.random.choice(len(y_test_arr), sample_size, replace=True)
-        if len(np.unique(y_test_arr[indices])) < 2:
-            continue
-
-        y_test_b = y_test_arr[indices]
-        y_prob_b = y_prob_arr[indices]
-        y_pred_b = (y_prob_b > 0.5).astype(int)
-
-        # Confusion matrix for this round
-        cm_b = confusion_matrix(y_test_b, y_pred_b, labels=[0, 1])
-        tn_b, fp_b, fn_b, tp_b = cm_b.ravel()
-        
-        acc_b = (tp_b + tn_b) / (tp_b + tn_b + fp_b + fn_b) if (tp_b + tn_b + fp_b + fn_b) > 0 else 0
-        sens_b = tp_b / (tp_b + fn_b) if (tp_b + fn_b) > 0 else 0
-        spec_b = tn_b / (tn_b + fp_b) if (tn_b + fp_b) > 0 else 0
-        prec_b = tp_b / (tp_b + fp_b) if (tp_b + fp_b) > 0 else 0
-        f1_b = 2 * prec_b * sens_b / (prec_b + sens_b) if (prec_b + sens_b) > 0 else 0
-
-        # ROC/AUC for this round
-        try:
-            fpr_b, tpr_b, _ = roc_curve(y_test_b, y_prob_b)
-            auc_b = auc(fpr_b, tpr_b)
-            tpr_interp = np.interp(base_fpr, fpr_b, tpr_b)
-            tpr_interp[0] = 0.0
-            tprs_array.append(tpr_interp)
-        except:
-            auc_b = float('nan')
-
-        bootstrap_cm_results.append({
-            'round': i + 1,
-            'TP': int(tp_b), 'TN': int(tn_b), 'FP': int(fp_b), 'FN': int(fn_b),
-            'Accuracy': round(acc_b, 4), 'Sensitivity': round(sens_b, 4),
-            'Specificity': round(spec_b, 4), 'F1': round(f1_b, 4),
-            'AUC': round(auc_b, 4) if not (auc_b != auc_b) else ''
-        })
-
-    # Save confusion matrix results to CSV
-    cm_df = pd.DataFrame(bootstrap_cm_results)
-    cm_df.to_csv('results/bootstrap_confusion_matrix.csv', index=False)
-    print(f"Saved bootstrap confusion matrix ({len(cm_df)} rounds) to 'results/bootstrap_confusion_matrix.csv'")
-
-    tprs_array = np.array(tprs_array)
-    mean_tprs = tprs_array.mean(axis=0)
-    mean_tprs[-1] = 1.0
-    
-    tpr_lower = np.percentile(tprs_array, 2.5, axis=0)
-    tpr_upper = np.percentile(tprs_array, 97.5, axis=0)
-
-    original_fpr, original_tpr, _ = roc_curve(y_test_arr, y_prob_arr)
-    roc_auc = auc(original_fpr, original_tpr)
-
-    # === Plot 1: True Bootstrap Lines Version ===
-    plt.figure(figsize=(8, 6))
-    n_plot = min(100, len(tprs_array))
-    sample_indices = np.random.choice(len(tprs_array), size=n_plot, replace=False)
-    for i, idx in enumerate(sample_indices):
-        if i == 0:
-            plt.plot(base_fpr, tprs_array[idx], color='steelblue', lw=1, alpha=0.3, label='Bootstrap Samples')
-        else:
-            plt.plot(base_fpr, tprs_array[idx], color='steelblue', lw=1, alpha=0.3)
-            
-    plt.plot(base_fpr, mean_tprs, color='darkorange', lw=3, label=f'Mean ROC (area = {roc_auc:.2f})')
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC (AUC = {auc_score:.4f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve (True Bootstrapping Lines) - Test Set')
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.savefig('plots/roc_curve_lines.png')
+    plt.title('Receiver Operating Characteristic')
+    plt.legend(loc='lower right')
+    plt.tight_layout()
+    plt.savefig('plots/roc_curve.png')
     plt.close()
-
-    # === Plot 2: Shaded 95%% CI Version ===
-    plt.figure(figsize=(8, 6))
-    plt.plot(base_fpr, mean_tprs, color='darkorange', lw=2, label=f'Mean ROC (area = {roc_auc:.2f})')
-    plt.fill_between(base_fpr, tpr_lower, tpr_upper, color='grey', alpha=0.3, label='95%% CI (Bootstrap)')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve (95%% CI Shaded - True Bootstrapping) - Test Set')
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.savefig('plots/roc_curve_ci.png')
-    plt.close()
-
-    print("Saved ROC curves to 'plots/roc_curve_lines.png' and 'plots/roc_curve_ci.png'")
-
-    print("\nPipeline finished successfully! All files are in the 'plots' directory.")
+    print("Saved ROC curve to 'plots/roc_curve.png'")
+    print("")
+    print("Pipeline finished successfully! All files are in the 'plots' directory.")
 
 if __name__ == "__main__":
     run_pipeline()

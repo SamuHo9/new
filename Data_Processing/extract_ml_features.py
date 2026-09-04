@@ -12,13 +12,23 @@ import numpy as np
 # =============================================================================
 # Helper: Folder Picker
 # =============================================================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "SPHARM", "split_data"))
+DEFAULT_OUTPUT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "Model", "Output_Dataset"))
+
 def prompt_folder(title):
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    folder = filedialog.askdirectory(title=title, initialdir=os.getcwd())
-    root.destroy()
-    return folder if folder else None
+    init_dir = DEFAULT_DATA_DIR if os.path.exists(DEFAULT_DATA_DIR) else os.getcwd()
+    try:
+        import qt
+        folder = qt.QFileDialog.getExistingDirectory(None, title, init_dir)
+        return folder if folder else None
+    except Exception:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title=title, initialdir=init_dir)
+        root.destroy()
+        return folder if folder else None
 
 
 # =============================================================================
@@ -51,15 +61,17 @@ def classify_subject(subject_name):
 # Main Extraction
 # =============================================================================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--spharm_dir", default=None,
-                        help="Path to spharm_results folder. ถ้าไม่ระบุจะเด้ง dialog")
+    parser = argparse.ArgumentParser(description="Extract 3D vertex coordinates and graph topology from SPHARM meshes.")
+    parser.add_argument("--spharm_dir", "--input_dir", default=None,
+                        help="Path to folder containing .vtk meshes (or spharm_results / split dataset folder).")
+    parser.add_argument("--output_dir", default=None,
+                        help="Path to directory to save extracted CSVs (default: Model/Output_Dataset).")
     args = parser.parse_args()
 
     spharm_dir = args.spharm_dir
     if not spharm_dir:
         print("Opening folder picker...")
-        spharm_dir = prompt_folder("Select 'spharm_results' folder (or output_xxx folder)")
+        spharm_dir = prompt_folder("Select SPHARM mesh folder (or dataset split folder)")
     
     if not spharm_dir:
         print("Error: No folder selected. Exiting.")
@@ -74,8 +86,11 @@ def main():
     print(f"Target folder: {spharm_dir}")
 
     # 1. ค้นหาไฟล์ aligned vtk
-    vtk_files = sorted(glob.glob(os.path.join(spharm_dir, "*_SPHARM_realigned.vtk")))
-    source = "realigned"
+    vtk_files = sorted(glob.glob(os.path.join(spharm_dir, "*_SPHARM_pca_ready.vtk")))
+    source = "pca_ready"
+    if not vtk_files:
+        vtk_files = sorted(glob.glob(os.path.join(spharm_dir, "*_SPHARM_realigned.vtk")))
+        source = "realigned"
     if not vtk_files:
         vtk_files = sorted(glob.glob(os.path.join(spharm_dir, "*_SPHARM_procalign.vtk")))
         source = "procalign"
@@ -93,12 +108,30 @@ def main():
     print(f"Found {len(vtk_files)} aligned meshes (source type: '{source}'). Processing...")
 
     # ตั้งค่าโฟลเดอร์สำหรับผลลัพธ์ ML
-    ml_output_dir = os.path.join(os.path.dirname(spharm_dir), "ml_features")
-    if not os.path.exists(ml_output_dir):
-        os.makedirs(ml_output_dir)
+    folder_basename = os.path.basename(spharm_dir.rstrip("\\/"))
+    parent_dir = os.path.dirname(spharm_dir.rstrip("\\/"))
+    parent_basename = os.path.basename(parent_dir)
+    grandparent_dir = os.path.dirname(parent_dir)
+    grandparent_basename = os.path.basename(grandparent_dir)
 
-    coords_csv_path = os.path.join(ml_output_dir, "spharm_xyz_coords.csv")
-    edges_csv_path = os.path.join(ml_output_dir, "mesh_edges.csv")
+    if folder_basename.lower() == "balanced" and parent_basename.lower() in ("train", "test"):
+        name_prefix = f"{grandparent_basename}_{parent_basename}_balanced"
+    elif folder_basename.lower() == "spharm_results":
+        name_prefix = parent_basename
+    elif folder_basename.lower() in ("train", "test", "balanced"):
+        name_prefix = f"{parent_basename}_{folder_basename}"
+    else:
+        name_prefix = folder_basename
+
+    if args.output_dir:
+        ml_output_dir = os.path.abspath(args.output_dir)
+    else:
+        ml_output_dir = DEFAULT_OUTPUT_DIR
+
+    os.makedirs(ml_output_dir, exist_ok=True)
+
+    coords_csv_path = os.path.join(ml_output_dir, f"{name_prefix}_xyz_coords.csv")
+    edges_csv_path = os.path.join(ml_output_dir, f"{name_prefix}_mesh_edges.csv")
 
     # 2. อ่านไฟล์แรกเพื่อสร้างหัวคอลัมน์และดึง Graph Topology (Edges)
     reader = vtk.vtkPolyDataReader()
@@ -149,7 +182,7 @@ def main():
             filename = os.path.basename(filepath)
             # ลบส่วนขยายออกเพื่อใช้เป็นชื่อ Subject
             subject_name = filename
-            for suffix in ("_SPHARM_realigned.vtk", "_SPHARM_procalign.vtk", "_SPHARM_ellalign.vtk"):
+            for suffix in ("_SPHARM_pca_ready.vtk", "_SPHARM_realigned.vtk", "_SPHARM_procalign.vtk", "_SPHARM_ellalign.vtk"):
                 subject_name = subject_name.replace(suffix, "")
 
             # จัดกลุ่ม

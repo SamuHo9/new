@@ -1,4 +1,5 @@
 __pycache__/
 venv/
+venv_broken/
 *.log
 slicer_batch_log.txt
