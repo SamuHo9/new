@@ -15,8 +15,6 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_curve, auc, recall_score, f1_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
-import sys
-
 class Logger(object):
     def __init__(self, filename):
         self.terminal = sys.stdout
@@ -34,10 +32,10 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(42)
 
-
 class Fire1D(nn.Module):
     def __init__(self, inplanes, squeeze_planes, expand1x1_planes, expand3x3_planes):
         super(Fire1D, self).__init__()
+        self.inplanes = inplanes
         self.squeeze = nn.Conv1d(inplanes, squeeze_planes, kernel_size=1)
         self.squeeze_activation = nn.ReLU(inplace=True)
         self.expand1x1 = nn.Conv1d(squeeze_planes, expand1x1_planes, kernel_size=1)
@@ -55,18 +53,19 @@ class Fire1D(nn.Module):
 class SqueezeNet1D(nn.Module):
     def __init__(self, in_channels=1, num_classes=1):
         super(SqueezeNet1D, self).__init__()
+        self.num_classes = num_classes
+
         self.features = nn.Sequential(
-            nn.Conv1d(in_channels, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(in_channels, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            Fire1D(64, 16, 64, 64),
-            Fire1D(128, 16, 64, 64),
-            nn.MaxPool1d(kernel_size=2, stride=2, ceil_mode=True),
-            Fire1D(128, 32, 128, 128),
-            Fire1D(256, 32, 128, 128),
+            Fire1D(16, 8, 16, 16),
+            Fire1D(32, 16, 32, 32),
+            Fire1D(64, 32, 64, 64),
         )
+
         self.classifier = nn.Sequential(
-            nn.Dropout(p=0.4),
-            nn.Conv1d(256, num_classes, kernel_size=1),
+            nn.Dropout(p=0.5),
+            nn.Conv1d(128, self.num_classes, kernel_size=1),
             nn.AdaptiveAvgPool1d(1)
         )
 
@@ -74,7 +73,6 @@ class SqueezeNet1D(nn.Module):
         x = self.features(x)
         x = self.classifier(x)
         return x.view(x.size(0), -1)
-
 
 def train_with_checkpoint(model, X_tr, y_tr, X_val, y_val, epochs=80, batch_size=32, lr=0.001, device='cpu', pos_weight=1.0, patience=25):
     pos_w_tensor = torch.tensor([pos_weight], dtype=torch.float32).to(device)
@@ -154,8 +152,15 @@ def run_pipeline():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    train_df = pd.read_csv('../Ds005602_Left_train_coef_features.csv')
-    test_df = pd.read_csv('../Ds005602_Left_test_coef_features.csv')
+    train_path = '../Ds005602_Left_train_coef_features.csv'
+    test_path = '../Ds005602_Left_test_coef_features.csv'
+    if not os.path.exists(train_path):
+        train_path = os.path.abspath(os.path.join(script_dir, '..', '..', '..', 'Output_Dataset', 'Ds005602_Left_train_coef_features.csv'))
+    if not os.path.exists(test_path):
+        test_path = os.path.abspath(os.path.join(script_dir, '..', '..', '..', 'Output_Dataset', 'Ds005602_Left_test_coef_features.csv'))
+
+    train_df = pd.read_csv(train_path)
+    test_df = pd.read_csv(test_path)
 
     meta_cols = ['Subject', 'Group', 'Class', 'BinaryClass', 'DataType', 'Group_Name', 'Group_Label', 'Unnamed: 0']
     
@@ -289,8 +294,101 @@ def run_pipeline():
     plt.savefig('plots/roc_curve.png')
     plt.close()
     print("Saved ROC curve to 'plots/roc_curve.png'")
+
+    # Bootstrap Confusion Matrix (1,000 iterations)
+    try:
+        n_bootstraps = 1000
+        tprs_array = []
+        base_fpr = np.linspace(0, 1, 101)
+        y_test_arr = np.array(y_test)
+        y_prob_arr = np.array(y_prob)
+        sample_size = len(y_test_arr)
+        bootstrap_cm_results = []
+        np.random.seed(42)
+
+        for i in range(n_bootstraps):
+            indices = np.random.choice(len(y_test_arr), sample_size, replace=True)
+            if len(np.unique(y_test_arr[indices])) < 2:
+                continue
+            y_test_b = y_test_arr[indices]
+            y_prob_b = y_prob_arr[indices]
+            y_pred_b = (y_prob_b > 0.5).astype(int)
+
+            cm_b = confusion_matrix(y_test_b, y_pred_b, labels=[0, 1])
+            tn_b, fp_b, fn_b, tp_b = cm_b.ravel()
+            acc_b = (tp_b + tn_b) / (tp_b + tn_b + fp_b + fn_b) if (tp_b + tn_b + fp_b + fn_b) > 0 else 0
+            sens_b = tp_b / (tp_b + fn_b) if (tp_b + fn_b) > 0 else 0
+            spec_b = tn_b / (tn_b + fp_b) if (tn_b + fp_b) > 0 else 0
+            prec_b = tp_b / (tp_b + fp_b) if (tp_b + fp_b) > 0 else 0
+            f1_b = 2 * prec_b * sens_b / (prec_b + sens_b) if (prec_b + sens_b) > 0 else 0
+
+            try:
+                fpr_b, tpr_b, _ = roc_curve(y_test_b, y_prob_b)
+                auc_b = auc(fpr_b, tpr_b)
+                tpr_interp = np.interp(base_fpr, fpr_b, tpr_b)
+                tpr_interp[0] = 0.0
+                tprs_array.append(tpr_interp)
+            except:
+                auc_b = float('nan')
+
+            bootstrap_cm_results.append({
+                'round': i + 1,
+                'TP': int(tp_b), 'TN': int(tn_b), 'FP': int(fp_b), 'FN': int(fn_b),
+                'Accuracy': round(acc_b, 4), 'Sensitivity': round(sens_b, 4),
+                'Specificity': round(spec_b, 4), 'F1': round(f1_b, 4),
+                'AUC': round(auc_b, 4) if not np.isnan(auc_b) else ''
+            })
+
+        cm_df = pd.DataFrame(bootstrap_cm_results)
+        cm_df.to_csv('results/bootstrap_confusion_matrix.csv', index=False)
+        print(f"Saved bootstrap confusion matrix ({len(cm_df)} rounds) to 'results/bootstrap_confusion_matrix.csv'")
+
+        if len(tprs_array) > 0:
+            tprs_array = np.array(tprs_array)
+            mean_tprs = tprs_array.mean(axis=0)
+            mean_tprs[-1] = 1.0
+            tpr_lower = np.percentile(tprs_array, 2.5, axis=0)
+            tpr_upper = np.percentile(tprs_array, 97.5, axis=0)
+
+            plt.figure(figsize=(8, 6))
+            n_plot = min(100, len(tprs_array))
+            sample_indices = np.random.choice(len(tprs_array), size=n_plot, replace=False)
+            for i, idx in enumerate(sample_indices):
+                if i == 0:
+                    plt.plot(base_fpr, tprs_array[idx], color='steelblue', lw=1, alpha=0.3, label='Bootstrap Samples')
+                else:
+                    plt.plot(base_fpr, tprs_array[idx], color='steelblue', lw=1, alpha=0.3)
+            plt.plot(base_fpr, mean_tprs, color='darkorange', lw=3, label=f'Mean ROC (AUC = {auc_score:.4f})')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title('ROC Curve (True Bootstrapping Lines) - Test Set')
+            plt.legend(loc='lower right')
+            plt.grid(True)
+            plt.savefig('plots/roc_curve_lines.png')
+            plt.close()
+
+            plt.figure(figsize=(8, 6))
+            plt.plot(base_fpr, mean_tprs, color='darkorange', lw=2, label=f'Mean ROC (AUC = {auc_score:.4f})')
+            plt.fill_between(base_fpr, tpr_lower, tpr_upper, color='grey', alpha=0.3, label='95% CI (Bootstrap)')
+            plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title('ROC Curve (95% CI Shaded - True Bootstrapping) - Test Set')
+            plt.legend(loc='lower right')
+            plt.grid(True)
+            plt.savefig('plots/roc_curve_ci.png')
+            plt.close()
+            print("Saved ROC curves to 'plots/roc_curve_lines.png' and 'plots/roc_curve_ci.png'")
+    except Exception as e:
+        print(f"Warning: Bootstrap plots generation skipped: {e}")
+
     print("")
     print("Pipeline finished successfully! All files are in the 'plots' directory.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_pipeline()
